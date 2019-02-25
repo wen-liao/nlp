@@ -6,7 +6,7 @@ from torch.nn import functional as F
 from torch import optim
 
 #preprocessing
-train_data_w = preprocessing(TRAIN_W_PATH)
+train_data = preprocessing(TRAIN_W_PATH)
 test_data = preprocessing(TEST_W_PATH)
 
 UNSEEN_WORD = "<UNSEEN_WORD>"
@@ -37,7 +37,7 @@ VOCAB_SZ = len(word2ix)
 CHARSET_SZ = len(char2ix)
 
 def process_tag(tags):
-    return torch.LongTensor([tag2ix for ele in tags])
+    return torch.LongTensor([tag2ix[ele] for ele in tags])
 
 def process_sent(sent):
     words = torch.LongTensor([word2ix[word] if word in word2ix else word2ix[UNSEEN_WORD] for word in sent])
@@ -47,6 +47,7 @@ def process_sent(sent):
     for word in sent:
         ix_seq.append(ix)
         ix += len(word)
+    ix_seq.append(ix)
     return words,chars,ix_seq
 
 
@@ -63,7 +64,7 @@ class ConcatCharLSTM_LSTM_CRF(nn.Module):
         self.char_hid_dim,self.hid_dim = char_hid_dim,hid_dim
         self.word_embed = nn.Embedding(vocab_sz,word_embed_dim)
         self.char_embed = nn.Embedding(charset_sz,char_embed_dim)
-        self.char_lstm = nn.LSTM(char_embed_dim,char_hid_dim//2,bidirectional=True)
+        self.char_lstm = nn.LSTM(char_embed_dim,char_hid_dim//4,bidirectional=True)
         self.lstm = nn.LSTM(word_embed_dim+char_hid_dim,hid_dim//2,bidirectional=True)
         self.hid2tag = nn.Linear(hid_dim,self.tagset_sz)
         self.transition = nn.Parameter(torch.randn((self.tagset_sz,self.tagset_sz)))
@@ -71,17 +72,20 @@ class ConcatCharLSTM_LSTM_CRF(nn.Module):
         self.transition.data[:,self.tag2ix[STOP_TAG]] = -10000
 
     def _init_char_hidden(self):
-        return torch.randn((2,1,self.char_hid_dim//2)), torch.randn((2,1,self.char_hid_dim//2))
+        return torch.randn((2,1,self.char_hid_dim//4)), torch.randn((2,1,self.char_hid_dim//4))
 
     def _init_hidden(self):
         return torch.randn((2,1,self.hid_dim//2)), torch.randn((2,1,self.hid_dim//2))
 
     def _get_lstm_features(self,sent):
         words,chars,ix_seq = sent
-        char_hids = self.char_lstm(self.char_embed(chars).view((len(chars),1,-1)),self._init_char_hidden())[0].view((1,1,-1))
+        char_hids = self.char_lstm(self.char_embed(chars).view((len(chars),1,-1)),self._init_char_hidden())[0].view((len(chars),1,-1))
         word_embeds = self.word_embed(words).view((len(words),1,-1))
         ##TODO:generate inputs using char_hids, word_embeds and ix_seqs
-
+        char_feats = []
+        for i in range(len(words)):
+            char_feats.append(torch.cat((char_hids[ix_seq[i]],char_hids[ix_seq[i+1]-1]),dim=1).view((1,1,-1)))
+        char_feats = torch.cat(char_feats,dim=1).view((len(char_feats),1,-1))
         embeds = torch.cat((char_feats,word_embeds),dim=2)
         hiddens = self.lstm(embeds,self._init_hidden())[0]
         outputs = self.hid2tag(hiddens)
@@ -103,7 +107,8 @@ class ConcatCharLSTM_LSTM_CRF(nn.Module):
         return torch.logsumexp(terminal_var,dim=0)
 
     def loss(self,sent,tags):
-        feats = self._get_lstm_features(sent).view((len(sent[1]),-1))
+        
+        feats = self._get_lstm_features(sent).view((len(sent[0]),-1))
         log_prob = self._get_log_prob(feats,tags)
         log_part = self._get_log_partition_function(feats)
         return log_part - log_prob
@@ -128,12 +133,12 @@ class ConcatCharLSTM_LSTM_CRF(nn.Module):
         assert id_ == self.tag2ix[START_TAG]
         return best_path_id[1:]
 
-WORD_EMBED_DIM = 80
-CHAR_EMBED_DIM = 40
-CHAR_HID_DIM = 30
-HID_DIM = 90
+WORD_EMBED_DIM = 90
+CHAR_EMBED_DIM = 100
+CHAR_HID_DIM = 160
+HID_DIM = 120
 
-model = CharLSTM_LSTM_CRF(VOCAB_SZ,WORD_EMBED_DIM,CHARSET_SZ,CHAR_EMBED_DIM,CHAR_HID_DIM,HID_DIM,tag2ix)
+model = ConcatCharLSTM_LSTM_CRF(VOCAB_SZ,WORD_EMBED_DIM,CHARSET_SZ,CHAR_EMBED_DIM,CHAR_HID_DIM,HID_DIM,tag2ix)
 optimizer = optim.SGD(model.parameters(), lr=0.01, weight_decay=1e-4)
 
 with torch.no_grad():
@@ -143,13 +148,14 @@ with torch.no_grad():
 
 print("Test Successfully.")
 
-file = open("charlstm_lstm_crf.txt",mode="a+")
+file = open("concat_charlstm_lstm_crf.txt",mode="a+")
 file.write("Char Embed Dim: %d  Char Hidden Dim: %d  Word Embed Dim: %d  Hidden Dim: %d  \n"%(CHAR_EMBED_DIM,CHAR_HID_DIM,WORD_EMBED_DIM,HID_DIM))
 file.close()
 
 
+
 # Make sure prepare_sequence from earlier in the LSTM section is loaded
-for epoch in range(20): # again, normally you would NOT do 300 epochs, it is toy data
+for epoch in range(5): # again, normally you would NOT do 300 epochs, it is toy data
     print(epoch)
     import time
     t1 = time.time()
@@ -169,7 +175,7 @@ for epoch in range(20): # again, normally you would NOT do 300 epochs, it is toy
         loss_t += loss.item()
         optimizer.step()
     t2 = time.time()
-    file = open("charlstm_lstm_crf.txt", mode="a+")
+    file = open("concat_charlstm_lstm_crf.txt", mode="a+")
     file.write("epoch: %d  "%(epoch))
     file.write("train time: %f s  "%((t2-t1)/60))
     file.write("total loss: %f\n"%(loss_t))
@@ -181,4 +187,4 @@ for epoch in range(20): # again, normally you would NOT do 300 epochs, it is toy
                 pred.append([ix2tag[ix] for ix in model(sentence)])
         file.write("Accuracy: %f  Precision: %f  Recall Rate: %f  F_measure: %f\n"%evaluate(pred,true))
     file.close()
-    torch.save(model,'.\\CHARLSTM_BiLSTM_CRF_80_40_30_90')
+    #torch.save(model,'.\\CONCAT_CHARLSTM_BiLSTM_CRF_' + str(WORD_EMBED_DIM) + '_' + str(CHAR_EMBED_DIM) + '_' + str(CHAR_HID_DIM) + '_' + str(HID_DIM))
